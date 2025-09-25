@@ -14,11 +14,15 @@
 (define-constant err-invalid-metadata (err u104))
 (define-constant err-unauthorized (err u105))
 (define-constant err-invalid-source (err u106))
+(define-constant err-lifecycle-not-found (err u107))
+(define-constant err-invalid-lifecycle-stage (err u108))
+(define-constant err-garment-disposed (err u109))
 
 ;; data vars
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (optional (string-utf8 256)) none)
 (define-data-var mint-enabled bool true)
+(define-data-var next-lifecycle-event-id uint u1)
 
 ;; data maps
 (define-map token-count principal uint)
@@ -66,6 +70,35 @@
 
 (define-map certification-authorities principal bool)
 
+(define-map garment-lifecycle
+  uint
+  {
+    current-stage: (string-utf8 32),
+    total-repairs: uint,
+    total-resales: uint,
+    condition-score: uint,
+    last-service-date: uint,
+    estimated-lifespan: uint,
+    disposal-method: (optional (string-utf8 64)),
+    recycling-score: uint,
+    active: bool
+  }
+)
+
+(define-map lifecycle-events
+  uint
+  {
+    token-id: uint,
+    event-type: (string-utf8 32),
+    description: (string-utf8 256),
+    cost: uint,
+    impact-score: uint,
+    service-provider: (optional principal),
+    timestamp: uint,
+    verifier: principal
+  }
+)
+
 ;; Non-Fungible Token trait
 (define-non-fungible-token provenance-passport uint)
 
@@ -112,6 +145,18 @@
       supply-chain: supply-chain,
       recycled-content: recycled-content,
       created-at: current-time
+    })
+    
+    (map-set garment-lifecycle token-id {
+      current-stage: u"NEW",
+      total-repairs: u0,
+      total-resales: u0,
+      condition-score: u100,
+      last-service-date: current-time,
+      estimated-lifespan: u3650,
+      disposal-method: none,
+      recycling-score: u0,
+      active: true
     })
     
     (map-set provenance-history token-id (list {
@@ -273,6 +318,135 @@
   )
 )
 
+(define-public (record-repair
+    (token-id uint)
+    (description (string-utf8 256))
+    (cost uint)
+    (service-provider (optional principal))
+    (condition-impact uint)
+  )
+  (let 
+    (
+      (owner (unwrap! (nft-get-owner? provenance-passport token-id) err-not-found))
+      (lifecycle (unwrap! (map-get? garment-lifecycle token-id) err-lifecycle-not-found))
+      (event-id (var-get next-lifecycle-event-id))
+      (current-time u1)
+    )
+    (asserts! (or (is-eq tx-sender owner) (is-eq tx-sender contract-owner)) err-not-token-owner)
+    (asserts! (get active lifecycle) err-garment-disposed)
+    (asserts! (<= condition-impact u50) err-invalid-metadata)
+    
+    (map-set lifecycle-events event-id {
+      token-id: token-id,
+      event-type: u"REPAIR",
+      description: description,
+      cost: cost,
+      impact-score: condition-impact,
+      service-provider: service-provider,
+      timestamp: current-time,
+      verifier: tx-sender
+    })
+    
+    (let ((new-condition (+ (get condition-score lifecycle) condition-impact)))
+      (map-set garment-lifecycle token-id (merge lifecycle {
+        total-repairs: (+ (get total-repairs lifecycle) u1),
+        condition-score: (if (> new-condition u100) u100 new-condition),
+        last-service-date: current-time,
+        current-stage: u"MAINTAINED"
+      }))
+    )
+    
+    (add-provenance-event token-id u"REPAIR" u"Garment repaired and maintained" tx-sender)
+    
+    (var-set next-lifecycle-event-id (+ event-id u1))
+    (ok event-id)
+  )
+)
+
+(define-public (record-resale
+    (token-id uint)
+    (sale-price uint)
+    (platform (string-utf8 64))
+    (condition-assessment uint)
+  )
+  (let 
+    (
+      (owner (unwrap! (nft-get-owner? provenance-passport token-id) err-not-found))
+      (lifecycle (unwrap! (map-get? garment-lifecycle token-id) err-lifecycle-not-found))
+      (event-id (var-get next-lifecycle-event-id))
+      (current-time u1)
+    )
+    (asserts! (or (is-eq tx-sender owner) (is-eq tx-sender contract-owner)) err-not-token-owner)
+    (asserts! (get active lifecycle) err-garment-disposed)
+    (asserts! (<= condition-assessment u100) err-invalid-metadata)
+    
+    (map-set lifecycle-events event-id {
+      token-id: token-id,
+      event-type: u"RESALE",
+      description: platform,
+      cost: sale-price,
+      impact-score: u0,
+      service-provider: none,
+      timestamp: current-time,
+      verifier: tx-sender
+    })
+    
+    (map-set garment-lifecycle token-id (merge lifecycle {
+      total-resales: (+ (get total-resales lifecycle) u1),
+      condition-score: condition-assessment,
+      last-service-date: current-time,
+      current-stage: u"RESOLD"
+    }))
+    
+    (add-provenance-event token-id u"RESALE" u"Garment resold on marketplace" tx-sender)
+    
+    (var-set next-lifecycle-event-id (+ event-id u1))
+    (ok event-id)
+  )
+)
+
+(define-public (record-disposal
+    (token-id uint)
+    (disposal-method (string-utf8 64))
+    (recycling-percentage uint)
+    (disposal-cost uint)
+  )
+  (let 
+    (
+      (owner (unwrap! (nft-get-owner? provenance-passport token-id) err-not-found))
+      (lifecycle (unwrap! (map-get? garment-lifecycle token-id) err-lifecycle-not-found))
+      (event-id (var-get next-lifecycle-event-id))
+      (current-time u1)
+    )
+    (asserts! (or (is-eq tx-sender owner) (is-eq tx-sender contract-owner)) err-not-token-owner)
+    (asserts! (get active lifecycle) err-garment-disposed)
+    (asserts! (<= recycling-percentage u100) err-invalid-metadata)
+    
+    (map-set lifecycle-events event-id {
+      token-id: token-id,
+      event-type: u"DISPOSAL",
+      description: disposal-method,
+      cost: disposal-cost,
+      impact-score: recycling-percentage,
+      service-provider: none,
+      timestamp: current-time,
+      verifier: tx-sender
+    })
+    
+    (map-set garment-lifecycle token-id (merge lifecycle {
+      current-stage: u"DISPOSED",
+      disposal-method: (some disposal-method),
+      recycling-score: recycling-percentage,
+      active: false
+    }))
+    
+    (add-provenance-event token-id u"DISPOSAL" u"Garment end-of-life disposal" tx-sender)
+    
+    (var-set next-lifecycle-event-id (+ event-id u1))
+    (ok event-id)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-last-token-id)
@@ -309,6 +483,14 @@
 
 (define-read-only (is-certification-authority (principal principal))
   (default-to false (map-get? certification-authorities principal))
+)
+
+(define-read-only (get-garment-lifecycle (token-id uint))
+  (map-get? garment-lifecycle token-id)
+)
+
+(define-read-only (get-lifecycle-event (event-id uint))
+  (map-get? lifecycle-events event-id)
 )
 
 (define-read-only (calculate-sustainability-score (token-id uint))
