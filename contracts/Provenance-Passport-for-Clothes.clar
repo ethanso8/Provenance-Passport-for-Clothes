@@ -17,6 +17,10 @@
 (define-constant err-lifecycle-not-found (err u107))
 (define-constant err-invalid-lifecycle-stage (err u108))
 (define-constant err-garment-disposed (err u109))
+(define-constant err-warranty-expired (err u110))
+(define-constant err-warranty-not-found (err u111))
+(define-constant err-warranty-already-claimed (err u112))
+(define-constant err-not-manufacturer (err u113))
 
 ;; data vars
 (define-data-var last-token-id uint u0)
@@ -96,6 +100,22 @@
     service-provider: (optional principal),
     timestamp: uint,
     verifier: principal
+  }
+)
+
+(define-map garment-warranties
+  uint
+  {
+    coverage-type: (string-utf8 64),
+    duration-days: uint,
+    terms: (string-utf8 256),
+    start-date: uint,
+    end-date: uint,
+    max-claim-amount: uint,
+    claimed: bool,
+    claim-date: (optional uint),
+    claim-description: (optional (string-utf8 256)),
+    manufacturer: principal
   }
 )
 
@@ -447,6 +467,82 @@
   )
 )
 
+(define-public (attach-warranty
+    (token-id uint)
+    (coverage-type (string-utf8 64))
+    (duration-days uint)
+    (terms (string-utf8 256))
+    (max-claim-amount uint)
+  )
+  (let
+    (
+      (metadata (unwrap! (map-get? garment-metadata token-id) err-not-found))
+      (current-time u1)
+      (end-date (+ current-time duration-days))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-not-manufacturer)
+    (asserts! (> duration-days u0) err-invalid-metadata)
+    (asserts! (> (len coverage-type) u0) err-invalid-metadata)
+    
+    (map-set garment-warranties token-id {
+      coverage-type: coverage-type,
+      duration-days: duration-days,
+      terms: terms,
+      start-date: current-time,
+      end-date: end-date,
+      max-claim-amount: max-claim-amount,
+      claimed: false,
+      claim-date: none,
+      claim-description: none,
+      manufacturer: tx-sender
+    })
+    
+    (add-provenance-event token-id u"WARRANTY_ATTACHED" u"Manufacturer warranty added" tx-sender)
+    
+    (print {
+      event: "warranty-attached",
+      token-id: token-id,
+      duration-days: duration-days,
+      manufacturer: tx-sender
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (claim-warranty
+    (token-id uint)
+    (claim-description (string-utf8 256))
+  )
+  (let
+    (
+      (owner (unwrap! (nft-get-owner? provenance-passport token-id) err-not-found))
+      (warranty (unwrap! (map-get? garment-warranties token-id) err-warranty-not-found))
+      (current-time u1)
+    )
+    (asserts! (is-eq tx-sender owner) err-not-token-owner)
+    (asserts! (not (get claimed warranty)) err-warranty-already-claimed)
+    (asserts! (<= current-time (get end-date warranty)) err-warranty-expired)
+    
+    (map-set garment-warranties token-id (merge warranty {
+      claimed: true,
+      claim-date: (some current-time),
+      claim-description: (some claim-description)
+    }))
+    
+    (add-provenance-event token-id u"WARRANTY_CLAIMED" u"Warranty claim submitted by owner" tx-sender)
+    
+    (print {
+      event: "warranty-claimed",
+      token-id: token-id,
+      owner: owner,
+      claim-date: current-time
+    })
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-last-token-id)
@@ -527,6 +623,55 @@
       sustainability: sustainability,
       owner: owner,
       sustainability-score: (unwrap-panic (calculate-sustainability-score token-id))
+    })
+  )
+)
+
+(define-read-only (get-warranty (token-id uint))
+  (map-get? garment-warranties token-id)
+)
+
+(define-read-only (is-warranty-valid (token-id uint))
+  (match (map-get? garment-warranties token-id)
+    warranty
+    (let
+      (
+        (current-time u1)
+        (is-active (<= current-time (get end-date warranty)))
+        (not-claimed (not (get claimed warranty)))
+      )
+      (ok (and is-active not-claimed))
+    )
+    (ok false)
+  )
+)
+
+(define-read-only (get-warranty-status (token-id uint))
+  (match (map-get? garment-warranties token-id)
+    warranty
+    (let
+      (
+        (current-time u1)
+        (days-remaining (if (> (get end-date warranty) current-time)
+                          (- (get end-date warranty) current-time)
+                          u0))
+      )
+      (ok {
+        exists: true,
+        valid: (unwrap-panic (is-warranty-valid token-id)),
+        claimed: (get claimed warranty),
+        days-remaining: days-remaining,
+        coverage-type: (get coverage-type warranty),
+        max-claim-amount: (get max-claim-amount warranty)
+      })
+    )
+    (ok {
+      exists: false,
+      valid: false,
+      claimed: false,
+      days-remaining: u0,
+      coverage-type: u"",
+      max-claim-amount: u0
     })
   )
 )
